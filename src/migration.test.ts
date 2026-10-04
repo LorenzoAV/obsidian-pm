@@ -2,7 +2,7 @@ import type { App } from 'obsidian'
 import { TFile } from 'obsidian'
 import { describe, expect, it, vi } from 'vitest'
 import { makeFakeApp } from '#test/fakeVault'
-import { migrateBoardCardConfig, migrateProjectLayout, migrateTaskRefs } from './migration'
+import { migrateBoardCardConfig, migrateProjectLayout, migrateTaskRefs, migrateProjectNesting } from './migration'
 import type PMPlugin from './main'
 import { ProjectStore, VaultIndex } from './store'
 import { DEFAULT_SETTINGS, makeDefaultFilter, makeDefaultGroup, makeDefaultSort, type PMSettings } from '@dotpm/core'
@@ -307,5 +307,226 @@ describe('migrateBoardCardConfig', () => {
     const { plugin, settings } = await vaultWith(['  autoSchedule: true'])
     await migrateBoardCardConfig(plugin)
     expect(settings.projectFilters).toEqual({})
+  })
+})
+
+describe('migrateProjectNesting', () => {
+  function projectNoteWithParent(id: string, title: string, parentPath: string | null): string {
+    const lines = ['---', 'pm-project: true', `id: ${id}`, `title: ${title}`]
+    if (parentPath) lines.push(`parent: "[[${parentPath.replace(/\.md$/, '')}]]"`)
+    lines.push('taskIds:', '  - t1', '---', '')
+    return lines.join('\n')
+  }
+
+  const taskNoteWithProject = (id: string, title: string, projectId: string): string =>
+    ['---', 'pm-task: true', `id: ${id}`, `projectId: ${projectId}`, `title: ${title}`, 'status: todo', '---', ''].join(
+      '\n'
+    )
+
+  async function nestedVault(): Promise<{ plugin: PMPlugin; app: App; settings: PMSettings }> {
+    const { app, vault } = makeFakeApp({ liveMetadataCache: true })
+    const typed = app as unknown as App
+    // Parent already in its own folder, Child at root (should be under parent)
+    await vault.create('Projects/Parent/Parent.md', projectNoteWithParent('p1', 'Parent', null))
+    await vault.create('Projects/Parent/_tasks/parent-task.md', taskNoteWithProject('t1', 'Parent Task', 'p1'))
+    await vault.create('Projects/Child.md', projectNoteWithParent('p2', 'Child', 'Projects/Parent/Parent.md'))
+    await vault.create('Projects/Child_tasks/child-task.md', taskNoteWithProject('t2', 'Child Task', 'p2'))
+
+    const settings: PMSettings = structuredClone(DEFAULT_SETTINGS)
+    const index = new VaultIndex(typed, () => settings)
+    index.build()
+    const store = new ProjectStore(typed, () => settings, index)
+
+    const plugin = {
+      app: {
+        ...typed,
+        workspace: {
+          iterateAllLeaves: (visit: (leaf: unknown) => void) => {}
+        }
+      },
+      index,
+      store,
+      settings,
+      saveSettings: async () => {}
+    } as unknown as PMPlugin
+
+    return { plugin, app: typed, settings }
+  }
+
+  async function threeLevelVault(): Promise<{ plugin: PMPlugin; app: App; settings: PMSettings }> {
+    const { app, vault } = makeFakeApp({ liveMetadataCache: true })
+    const typed = app as unknown as App
+    // Grandparent -> Parent -> Child (all in folder layout except Child at root)
+    await vault.create('Projects/Grandparent/Grandparent.md', projectNoteWithParent('p1', 'Grandparent', null))
+    await vault.create('Projects/Grandparent/_tasks/gp-task.md', taskNoteWithProject('t1', 'GP Task', 'p1'))
+    await vault.create(
+      'Projects/Parent.md',
+      projectNoteWithParent('p2', 'Parent', 'Projects/Grandparent/Grandparent.md')
+    )
+    await vault.create('Projects/Parent_tasks/p-task.md', taskNoteWithProject('t2', 'P Task', 'p2'))
+    // Parent is at Projects/Parent.md (flat), so Child's parent link should point there
+    await vault.create('Projects/Child.md', projectNoteWithParent('p3', 'Child', 'Projects/Parent.md'))
+    await vault.create('Projects/Child_tasks/c-task.md', taskNoteWithProject('t3', 'C Task', 'p3'))
+
+    const settings: PMSettings = structuredClone(DEFAULT_SETTINGS)
+    const index = new VaultIndex(typed, () => settings)
+    index.build()
+    const store = new ProjectStore(typed, () => settings, index)
+
+    const plugin = {
+      app: {
+        ...typed,
+        workspace: {
+          iterateAllLeaves: (visit: (leaf: unknown) => void) => {}
+        }
+      },
+      index,
+      store,
+      settings,
+      saveSettings: async () => {}
+    } as unknown as PMPlugin
+
+    return { plugin, app: typed, settings }
+  }
+
+  it('moves a child project at root under its parent folder', async () => {
+    const { plugin, app } = await nestedVault()
+
+    await migrateProjectNesting(plugin)
+
+    // Child moved under Parent
+    expect(app.vault.getAbstractFileByPath('Projects/Parent/Child/Child.md')).toBeInstanceOf(TFile)
+    expect(app.vault.getAbstractFileByPath('Projects/Child.md')).toBeNull()
+    expect(app.vault.getAbstractFileByPath('Projects/Parent/Child/_tasks/child-task.md')).toBeInstanceOf(TFile)
+    expect(app.vault.getAbstractFileByPath('Projects/Child_tasks')).toBeNull()
+
+    // Child's parent link updated
+    const child = await plugin.store.loadProjectByPath('Projects/Parent/Child/Child.md')
+    expect(child?.parentPath).toBe('Projects/Parent/Parent.md')
+  })
+
+  it('does nothing when child is already correctly nested', async () => {
+    const { app, vault } = makeFakeApp({ liveMetadataCache: true })
+    const typed = app as unknown as App
+    // Already correctly nested
+    await vault.create('Projects/Parent/Parent.md', projectNoteWithParent('p1', 'Parent', null))
+    await vault.create('Projects/Parent/_tasks/parent-task.md', taskNoteWithProject('t1', 'Parent Task', 'p1'))
+    await vault.create(
+      'Projects/Parent/Child/Child.md',
+      projectNoteWithParent('p2', 'Child', 'Projects/Parent/Parent.md')
+    )
+    await vault.create('Projects/Parent/Child/_tasks/child-task.md', taskNoteWithProject('t2', 'Child Task', 'p2'))
+
+    const settings: PMSettings = structuredClone(DEFAULT_SETTINGS)
+    const index = new VaultIndex(typed, () => settings)
+    index.build()
+    const store = new ProjectStore(typed, () => settings, index)
+
+    const plugin = {
+      app: typed,
+      index,
+      store,
+      settings,
+      saveSettings: async () => {}
+    } as unknown as PMPlugin
+
+    await migrateProjectNesting(plugin)
+
+    // Nothing moved
+    expect(app.vault.getAbstractFileByPath('Projects/Parent/Child/Child.md')).toBeInstanceOf(TFile)
+    expect(app.vault.getAbstractFileByPath('Projects/Child.md')).toBeNull()
+  })
+
+  it('handles three-level nesting: grandparent -> parent -> child', async () => {
+    const { plugin, app } = await threeLevelVault()
+
+    await migrateProjectNesting(plugin)
+
+    // All moved under grandparent
+    expect(app.vault.getAbstractFileByPath('Projects/Grandparent/Parent/Parent.md')).toBeInstanceOf(TFile)
+    expect(app.vault.getAbstractFileByPath('Projects/Grandparent/Parent/Child/Child.md')).toBeInstanceOf(TFile)
+    expect(app.vault.getAbstractFileByPath('Projects/Parent.md')).toBeNull()
+    expect(app.vault.getAbstractFileByPath('Projects/Child.md')).toBeNull()
+
+    // Links updated
+    const parent = await plugin.store.loadProjectByPath('Projects/Grandparent/Parent/Parent.md')
+    expect(parent?.parentPath).toBe('Projects/Grandparent/Grandparent.md')
+
+    const child = await plugin.store.loadProjectByPath('Projects/Grandparent/Parent/Child/Child.md')
+    expect(child?.parentPath).toBe('Projects/Grandparent/Parent/Parent.md')
+  })
+
+  it('skips project with broken parent link', async () => {
+    const { app, vault } = makeFakeApp({ liveMetadataCache: true })
+    const typed = app as unknown as App
+    // Child points to non-existent parent
+    await vault.create('Projects/Parent.md', projectNoteWithParent('p1', 'Parent', null))
+    await vault.create('Projects/Parent_tasks/parent-task.md', taskNoteWithProject('t1', 'Parent Task', 'p1'))
+    await vault.create('Projects/Child.md', projectNoteWithParent('p2', 'Child', 'Projects/NonExistent.md'))
+    await vault.create('Projects/Child_tasks/child-task.md', taskNoteWithProject('t2', 'Child Task', 'p2'))
+
+    const settings: PMSettings = structuredClone(DEFAULT_SETTINGS)
+    const index = new VaultIndex(typed, () => settings)
+    index.build()
+    const store = new ProjectStore(typed, () => settings, index)
+
+    const plugin = {
+      app: typed,
+      index,
+      store,
+      settings,
+      saveSettings: async () => {}
+    } as unknown as PMPlugin
+
+    await migrateProjectNesting(plugin)
+
+    // Child not moved (broken parent link)
+    expect(app.vault.getAbstractFileByPath('Projects/Child.md')).toBeInstanceOf(TFile)
+    expect(app.vault.getAbstractFileByPath('Projects/Parent/Child')).toBeNull()
+  })
+
+  it('is idempotent: second run moves nothing', async () => {
+    const { plugin, app } = await nestedVault()
+
+    await migrateProjectNesting(plugin)
+    const childPath1 = 'Projects/Parent/Child/Child.md'
+    const childFile1 = app.vault.getAbstractFileByPath(childPath1)
+
+    await migrateProjectNesting(plugin)
+    const childFile2 = app.vault.getAbstractFileByPath(childPath1)
+
+    expect(childFile2).toBe(childFile1)
+  })
+
+  it('remaps project filters and scope views using the correct old path (from)', async () => {
+    const { plugin, settings } = await nestedVault()
+    // Add a filter for the OLD child path (Projects/Child.md)
+    const oldChildPath = 'Projects/Child.md'
+    settings.projectFilters[`project:${oldChildPath}`] = {
+      filter: makeDefaultFilter(),
+      activeSavedViewId: null,
+      sort: makeDefaultSort(),
+      group: makeDefaultGroup(),
+      fields: {},
+      ganttGranularity: 'week',
+      nonWorkingDays: {}
+    }
+    settings.scopeViews[`subtree:${oldChildPath}`] = [
+      {
+        id: 'v1',
+        name: 'Test',
+        filter: makeDefaultFilter(),
+        sort: makeDefaultSort()
+      }
+    ]
+
+    await migrateProjectNesting(plugin)
+
+    // After migration, the filter should be at the NEW path
+    const newChildPath = 'Projects/Parent/Child/Child.md'
+    expect(settings.projectFilters[`project:${newChildPath}`]).toBeDefined()
+    expect(settings.projectFilters[`project:${oldChildPath}`]).toBeUndefined()
+    expect(settings.scopeViews[`subtree:${newChildPath}`]).toBeDefined()
+    expect(settings.scopeViews[`subtree:${oldChildPath}`]).toBeUndefined()
   })
 })

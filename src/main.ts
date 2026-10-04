@@ -59,7 +59,13 @@ import {
 import { Notifier } from './components/Notifier'
 import { AutoArchiver } from './components/AutoArchiver'
 import { IdRepair } from './components/IdRepair'
-import { migrateBoardCardConfig, migrateProjects, migrateProjectLayout, migrateTaskRefs } from './migration'
+import {
+  migrateBoardCardConfig,
+  migrateProjectNesting,
+  migrateProjects,
+  migrateProjectLayout,
+  migrateTaskRefs
+} from './migration'
 import { LocalApi } from './api/LocalApi'
 import { exportViewAsHtml } from './export/exportView'
 import { generateToken, LocalApiServer } from './api/LocalApiServer'
@@ -230,6 +236,14 @@ export default class PMPlugin extends Plugin {
       callback: () => {
         this.index.build()
         this.showNotice(tn('commands.rebuildIndexDone', this.index.projectRefs(true).length))
+      }
+    })
+
+    this.addCommand({
+      id: 'move-subprojects-under-parents',
+      name: t('commands.moveSubprojects'),
+      callback: async () => {
+        await migrateProjectNesting(this)
       }
     })
 
@@ -596,6 +610,7 @@ export default class PMPlugin extends Plugin {
   private async startupSweep(): Promise<void> {
     await migrateProjects(this)
     await migrateProjectLayout(this)
+    await migrateProjectNesting(this)
     await migrateTaskRefs(this)
     await migrateBoardCardConfig(this)
     await this.idRepair.check()

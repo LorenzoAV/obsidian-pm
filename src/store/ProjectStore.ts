@@ -63,7 +63,9 @@ import {
   projectTaskFolder,
   resolveVaultLink,
   TASK_FOLDER_NAME,
-  projectFilePath
+  projectFilePath,
+  newProjectFolder,
+  nameOf
 } from './vaultFs'
 import type { ImportNoteOptions, TaskSource } from './TaskSource'
 
@@ -669,6 +671,9 @@ export class ProjectStore implements TaskSource {
     Object.assign(project, patch)
     if (patch.description !== undefined) this.hydratedBodies.add(project)
     if (patch.title !== undefined) await this.renameProjectFile(project, previousPath)
+    if ('parentPath' in patch) {
+      await this.placeProjectUnderParent(project)
+    }
     await this.saveProject(project)
   }
 
@@ -696,6 +701,134 @@ export class ProjectStore implements TaskSource {
     await this.app.fileManager.renameFile(file, target)
     const notePath = await keepProjectStorageWithNote(this.app, currentPath, target, (p) => this.markSelfWrite(p))
     await this.rekeyProject(currentPath, notePath, oldTaskFolder)
+  }
+
+  /**
+   * Moves a project's folder under its current parent (or back to the projects folder if parent is cleared).
+   * Also rewrites descendant project parent links to reflect the new folder structure.
+   * Returns move info if moved, null if no move was needed or it was aborted.
+   */
+  async placeProjectUnderParent(
+    project: Project
+  ): Promise<{ from: string; to: string; tasksFrom: string; tasksTo: string } | null> {
+    // Capture the ORIGINAL note path BEFORE any mutation (moveProjectIntoOwnFolder mutates project.filePath)
+    const originalNotePath = project.filePath
+
+    // 1. If the project doesn't have its own folder yet, give it one first.
+    if (!projectFolderOf(this.app, project.filePath)) {
+      await this.moveProjectIntoOwnFolder(project.filePath)
+    }
+
+    const own = projectFolderOf(this.app, project.filePath)
+    if (!own) return null // leave it to saveProject to just write the link
+
+    const targetDir = newProjectFolder(this.app, this.getSettings().projectsFolder, project.parentPath)
+    const folderName = nameOf(own)
+    const target = normalizePath(`${targetDir}/${folderName}`)
+
+    // If target is the same as own, nothing to do.
+    if (target === own) return null
+
+    // Cycle guard: if the new parent is inside this project's folder, abort with Notice.
+    if (targetDir.startsWith(own + '/')) {
+      new Notice(t('store.cycleDetected', { title: project.title }))
+      return null
+    }
+
+    // Collision guard: if target folder already exists, abort the move (link still gets written).
+    if (findIgnoringCase(this.app, target)) {
+      new Notice(t('store.folderExists', { folder: folderName }))
+      return null
+    }
+
+    // Collect descendants BEFORE moving (including their old task folders)
+    const descendants = this.collectProjectDescendants(own)
+
+    // Ensure target directory exists
+    await this.ensureFolder(targetDir)
+
+    // Move the folder
+    await this.moveOwnFolder(own, target, project)
+
+    // Rekey the main project
+    const newNotePath = normalizePath(`${target}/${project.filePath.slice(project.filePath.lastIndexOf('/') + 1)}`)
+    const oldTaskFolder = projectTaskFolder(this.app, project.filePath)
+    await this.rekeyProject(project.filePath, newNotePath, oldTaskFolder)
+
+    // Rekey descendants and repoint their parent links
+    await this.rekeyAndRepointDescendants(target, own, descendants)
+
+    return {
+      from: originalNotePath,
+      to: newNotePath,
+      tasksFrom: oldTaskFolder,
+      tasksTo: normalizePath(`${target}/${TASK_FOLDER_NAME}`)
+    }
+  }
+
+  private collectProjectDescendants(own: string): { oldPath: string; rel: string; oldTaskFolder: string }[] {
+    const descendants: { oldPath: string; rel: string; oldTaskFolder: string }[] = []
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      if (!file.path.startsWith(own + '/')) continue
+      const cache = this.app.metadataCache.getFileCache(file)
+      if (cache?.frontmatter?.[FRONTMATTER_KEY] === true) {
+        const rel = file.path.slice(own.length + 1)
+        descendants.push({
+          oldPath: file.path,
+          rel,
+          oldTaskFolder: projectTaskFolder(this.app, file.path)
+        })
+      }
+    }
+    return descendants
+  }
+
+  private async moveOwnFolder(own: string, target: string, project: Project): Promise<void> {
+    // Mark self-writes for paths involved
+    this.markSelfWrite(own)
+    this.markSelfWrite(target)
+    this.markSelfWrite(project.filePath)
+    const newNotePath = normalizePath(`${target}/${project.filePath.slice(project.filePath.lastIndexOf('/') + 1)}`)
+    this.markSelfWrite(newNotePath)
+    const oldTaskFolder = projectTaskFolder(this.app, project.filePath)
+    const newTaskFolder = normalizePath(`${target}/${TASK_FOLDER_NAME}`)
+    this.markSelfWrite(oldTaskFolder)
+    this.markSelfWrite(newTaskFolder)
+
+    // Move the folder (rename the folder, not the note)
+    const ownFolder = this.app.vault.getAbstractFileByPath(own)
+    if (!(ownFolder instanceof TFolder)) return
+    await this.app.vault.rename(ownFolder, target)
+  }
+
+  private async rekeyAndRepointDescendants(
+    target: string,
+    own: string,
+    descendants: { oldPath: string; rel: string; oldTaskFolder: string }[]
+  ): Promise<void> {
+    for (const { oldPath, rel, oldTaskFolder } of descendants) {
+      const newPath = normalizePath(`${target}/${rel}`)
+      const file = this.app.vault.getAbstractFileByPath(newPath)
+      if (!(file instanceof TFile)) continue
+
+      // Rekey the descendant project using the existing rekeyProject method
+      await this.rekeyProject(oldPath, newPath, oldTaskFolder)
+
+      // Read raw frontmatter parent and rewrite path-based links
+      const content = await this.app.vault.cachedRead(file)
+      const parsed = parseFrontmatter(content)
+      if (parsed.kind !== 'frontmatter') continue
+      const rawParent = parsed.frontmatter?.parent
+      if (typeof rawParent !== 'string') continue
+
+      const inner = /^\[\[(.+?)\]\]$/.exec(rawParent.trim())?.[1] ?? rawParent.trim()
+      const linkpath = inner.split('|')[0].trim()
+      if (!linkpath || !linkpath.startsWith(own)) continue // only rewrite path-based links
+
+      // Replace the prefix
+      const mapped = linkpath.replace(own, target)
+      await this.repointProjectParent(newPath, mapped)
+    }
   }
 
   private async doSaveProject(project: Project): Promise<void> {

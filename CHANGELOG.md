@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Subprojects whose folder is not under their parent are now automatically moved to the correct location at startup and via the "Move subprojects under their parents" command
 - Tasks in the table view can now be reordered by drag-and-drop when sorted by status
 - Added "Open as note" to the project overview and the tab's "More options" menu
 - Added parent project links and a project switcher to the top of the task views

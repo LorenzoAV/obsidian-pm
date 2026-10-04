@@ -1,6 +1,7 @@
-import { Notice, TFile } from 'obsidian'
+import { Notice, TFile, normalizePath } from 'obsidian'
 import type PMPlugin from './main'
 import type { ScopeSpec } from './store'
+import { ProjectStore } from './store'
 import { isRefLink } from './store/refs'
 import {
   legacyBoardFields,
@@ -12,6 +13,7 @@ import {
   t,
   tn
 } from '@dotpm/core'
+import { projectFolderOf, newProjectFolder, nameOf, findIgnoringCase } from './store/vaultFs'
 
 /** Rewrites projects whose tasks are embedded in frontmatter as one file per task. */
 export async function migrateProjects(plugin: PMPlugin): Promise<void> {
@@ -262,4 +264,114 @@ function retargetOpenViews(plugin: PMPlugin, moves: ProjectMove[]): void {
 
     if (changed) void leaf.setViewState({ ...viewState, state })
   })
+}
+
+/**
+ * Fixes projects whose parent link does not match their folder location.
+ * Runs at startup and via command. Idempotent.
+ */
+export async function migrateProjectNesting(plugin: PMPlugin): Promise<void> {
+  const paths = plugin.index.projectPaths(true)
+
+  // Sort by depth ascending (ancestors first) using index.parentOf
+  const depth = new Map<string, number>()
+  const getDepth = (path: string): number => {
+    const cached = depth.get(path)
+    if (cached !== undefined) return cached
+    const parent = plugin.index.parentOf(path)
+    const d = parent ? getDepth(parent.path) + 1 : 0
+    depth.set(path, d)
+    return d
+  }
+  paths.sort((a, b) => getDepth(a) - getDepth(b))
+
+  const moves: ProjectMove[] = []
+  // Track the final (or current) path of each project as we process them.
+  // This lets children find their parent's new location after it's been moved.
+  const finalPath = new Map<string, string>()
+  for (const path of paths) finalPath.set(path, path)
+
+  for (const path of paths) {
+    try {
+      const parentRef = plugin.index.parentOf(path)
+      // Skip if no parent (root project) or parent link is broken/cyclic
+      if (!parentRef) continue
+
+      const project = await plugin.store.loadProjectByPath(path)
+      if (!project) continue
+
+      // Calculate the target directory using the parent's FINAL path (if moved),
+      // not the stale index path. This handles multi-level nesting correctly.
+      const parentFinalPath = finalPath.get(parentRef.path) ?? parentRef.path
+      const expectedDir = newProjectFolder(plugin.app, plugin.settings.projectsFolder, parentFinalPath)
+
+      // Capture the ORIGINAL note path BEFORE any flat-to-folder migration.
+      // This ensures remapProjectSettings uses the correct key (the flat path where filters/views live).
+      const originalNotePath = project.filePath
+
+      const own = projectFolderOf(plugin.app, project.filePath)
+      if (!own) {
+        // Flat project: give it its own folder first, then move under parent.
+        await plugin.store.moveProjectIntoOwnFolder(project.filePath)
+      }
+
+      // Re-read own folder after potential migration
+      const ownAfter = projectFolderOf(plugin.app, project.filePath)
+      if (!ownAfter) continue
+
+      const folderName = nameOf(ownAfter)
+      const target = normalizePath(`${expectedDir}/${folderName}`)
+
+      // If already in the right place, record final path and continue
+      if (target === ownAfter) {
+        finalPath.set(path, project.filePath)
+        continue
+      }
+
+      // Cycle guard: if the new parent is inside this project's folder, abort with Notice.
+      if (expectedDir.startsWith(ownAfter + '/')) {
+        new Notice(t('store.cycleDetected', { title: project.title }))
+        continue
+      }
+
+      // Collision guard: if target folder already exists, abort the move (link still gets written).
+      if (findIgnoringCase(plugin.app, target)) {
+        new Notice(t('store.folderExists', { folder: folderName }))
+        continue
+      }
+
+      // Update project.parentPath so placeProjectUnderParent calculates the correct target
+      project.parentPath = parentFinalPath
+
+      const store = plugin.store as unknown as ProjectStore
+      const move = await store.placeProjectUnderParent(project)
+      if (move) {
+        // Override the 'from' path with the original flat path (if it was flat)
+        // so remapProjectSettings finds the correct settings keys.
+        const moveWithOriginalFrom = {
+          ...move,
+          from: originalNotePath
+        }
+        moves.push(moveWithOriginalFrom)
+        // Update final path for this project and its descendants
+        finalPath.set(path, moveWithOriginalFrom.to)
+        // Also update any descendants that were moved with it
+        for (const [p, pPath] of finalPath) {
+          if (pPath.startsWith(move.from + '/') || pPath === move.from) {
+            finalPath.set(p, pPath.replace(move.from, move.to))
+          }
+        }
+      }
+    } catch (e) {
+      console.error(`[PM] Failed to fix nesting for "${path}":`, e)
+      new Notice(t('migration.nestingFailed', { path }))
+    }
+  }
+
+  if (moves.length === 0) return
+
+  remapProjectSettings(plugin, moves)
+  retargetOpenViews(plugin, moves)
+  await plugin.saveSettings()
+  new Notice(tn('migration.nested', moves.length))
 }

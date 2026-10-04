@@ -23,7 +23,7 @@ export function folderOf(path: string): string {
   return at === -1 ? '' : path.slice(0, at)
 }
 
-function nameOf(path: string): string {
+export function nameOf(path: string): string {
   return path.slice(path.lastIndexOf('/') + 1).replace(/\.md$/, '')
 }
 

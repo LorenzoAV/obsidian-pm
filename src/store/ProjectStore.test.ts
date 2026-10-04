@@ -333,6 +333,156 @@ describe('ProjectStore round-trip', () => {
     expect(reloaded?.parentPath).toBe('Projects/Platform/Platform.md')
   })
 
+  describe('project folder move on parent change', () => {
+    const flush = async (): Promise<void> => {
+      for (let i = 0; i < 3; i++) await new Promise((resolve) => window.setTimeout(resolve, 0))
+    }
+
+    it('moves a project folder under the new parent folder when parentPath changes', async () => {
+      const { store, app } = newIndexedStore()
+      const parent = await store.createProject('Parent', 'Projects')
+      const child = await store.createProject('Child', 'Projects')
+      await addNamed(store, child, 'Task in child')
+
+      await store.updateProject(child, { parentPath: parent.filePath })
+      await flush()
+
+      // Child folder moved under parent folder
+      expect(app.vault.getAbstractFileByPath('Projects/Parent/Child')).toBeInstanceOf(TFolder)
+      expect(app.vault.getAbstractFileByPath('Projects/Child')).toBeNull()
+      // Child note and tasks moved with it
+      expect(child.filePath).toBe('Projects/Parent/Child/Child.md')
+      expect(app.vault.getAbstractFileByPath('Projects/Parent/Child/Child.md')).toBeInstanceOf(TFile)
+      expect(app.vault.getAbstractFileByPath('Projects/Parent/Child/_tasks/task-in-child.md')).toBeInstanceOf(TFile)
+    })
+
+    it('moves the project folder back to the projects folder when parentPath is cleared', async () => {
+      const { store, app } = newIndexedStore()
+      await store.createProject('Parent', 'Projects')
+      const child = await store.createProject('Child', 'Projects/Parent')
+      await addNamed(store, child, 'Task in child')
+
+      await store.updateProject(child, { parentPath: '' })
+      await flush()
+
+      // Child folder moved back to Projects/
+      expect(app.vault.getAbstractFileByPath('Projects/Child')).toBeInstanceOf(TFolder)
+      expect(app.vault.getAbstractFileByPath('Projects/Parent/Child')).toBeNull()
+      expect(child.filePath).toBe('Projects/Child/Child.md')
+      expect(app.vault.getAbstractFileByPath('Projects/Child/Child.md')).toBeInstanceOf(TFile)
+      expect(app.vault.getAbstractFileByPath('Projects/Child/_tasks/task-in-child.md')).toBeInstanceOf(TFile)
+    })
+
+    it('moves the project folder back when parentPath is explicitly set to undefined (UI clear)', async () => {
+      const { store, app } = newIndexedStore()
+      await store.createProject('Parent', 'Projects')
+      const child = await store.createProject('Child', 'Projects/Parent')
+      await addNamed(store, child, 'Task in child')
+
+      // UI sends parentPath: undefined when clearing
+      await store.updateProject(child, { parentPath: undefined })
+      await flush()
+
+      // Child folder moved back to Projects/
+      expect(app.vault.getAbstractFileByPath('Projects/Child')).toBeInstanceOf(TFolder)
+      expect(app.vault.getAbstractFileByPath('Projects/Parent/Child')).toBeNull()
+      expect(child.filePath).toBe('Projects/Child/Child.md')
+      expect(app.vault.getAbstractFileByPath('Projects/Child/Child.md')).toBeInstanceOf(TFile)
+      expect(app.vault.getAbstractFileByPath('Projects/Child/_tasks/task-in-child.md')).toBeInstanceOf(TFile)
+    })
+
+    it('does not move the folder if the target already exists, but writes the parent link', async () => {
+      const { store, app } = newIndexedStore()
+      const parent = await store.createProject('Parent', 'Projects')
+      // Create a conflicting folder at the target location
+      await app.vault.createFolder('Projects/Parent/Child')
+      const child = await store.createProject('Child', 'Projects')
+      await addNamed(store, child, 'Task in child')
+
+      await store.updateProject(child, { parentPath: parent.filePath })
+      await flush()
+
+      // Folder was not moved (collision)
+      expect(app.vault.getAbstractFileByPath('Projects/Child')).toBeInstanceOf(TFolder)
+      expect(app.vault.getAbstractFileByPath('Projects/Parent/Child')).toBeInstanceOf(TFolder)
+      // But the parent link was still written
+      const content = await app.vault.cachedRead(fileAt(app, child.filePath))
+      expect(content).toContain('parent: "[[Projects/Parent/Parent]]"')
+      expect(child.parentPath).toBe('Projects/Parent/Parent.md')
+    })
+
+    it('rewrites descendant project parent links with the new folder prefix', async () => {
+      const { store, app } = newIndexedStore()
+      const grandparent = await store.createProject('Grandparent', 'Projects')
+      const parent = await store.createProject('Parent', 'Projects/Grandparent')
+      // Explicitly set parentPath so there's a link to rewrite
+      await store.updateProject(parent, { parentPath: grandparent.filePath })
+      const child = await store.createProject('Child', 'Projects/Grandparent/Parent')
+      await store.updateProject(child, { parentPath: parent.filePath })
+      await addNamed(store, child, 'Task in child')
+
+      // Move grandparent under a new parent
+      const newParent = await store.createProject('NewParent', 'Projects')
+      await store.updateProject(grandparent, { parentPath: newParent.filePath })
+      await flush()
+
+      // Grandparent and its subtree moved
+      expect(app.vault.getAbstractFileByPath('Projects/NewParent/Grandparent')).toBeInstanceOf(TFolder)
+      expect(app.vault.getAbstractFileByPath('Projects/Grandparent')).toBeNull()
+
+      // Descendant parent links rewritten
+      const parentContent = await app.vault.cachedRead(fileAt(app, parent.filePath))
+      expect(parentContent).toContain('parent: "[[Projects/NewParent/Grandparent/Grandparent]]"')
+
+      const childContent = await app.vault.cachedRead(fileAt(app, child.filePath))
+      expect(childContent).toContain('parent: "[[Projects/NewParent/Grandparent/Parent/Parent]]"')
+    })
+
+    it('aborts the move if the new parent is inside the project (cycle guard)', async () => {
+      const { store, app } = newIndexedStore()
+      const parent = await store.createProject('Parent', 'Projects')
+      const child = await store.createProject('Child', 'Projects/Parent')
+      await addNamed(store, child, 'Task in child')
+
+      // Try to move parent under child (would create a cycle)
+      await store.updateProject(parent, { parentPath: child.filePath })
+      await flush()
+
+      // Parent was not moved
+      expect(app.vault.getAbstractFileByPath('Projects/Parent')).toBeInstanceOf(TFolder)
+      expect(app.vault.getAbstractFileByPath('Projects/Parent/Child')).toBeInstanceOf(TFolder)
+      // Parent link was still written (but points to child)
+      const content = await app.vault.cachedRead(fileAt(app, parent.filePath))
+      expect(content).toContain('parent: "[[Projects/Parent/Child/Child]]"')
+    })
+
+    it('moves a legacy project (flat layout) under a parent by first giving it its own folder', async () => {
+      const { store, app } = newIndexedStore()
+      const parent = await store.createProject('Parent', 'Projects')
+      // Create a legacy project (flat layout)
+      await app.vault.create(
+        'Projects/Legacy.md',
+        ['---', 'pm-project: true', 'id: p1', 'title: Legacy', 'taskIds: []', '---', ''].join('\n')
+      )
+      await app.vault.createFolder('Projects/Legacy_tasks')
+      await app.vault.create(
+        'Projects/Legacy_tasks/first.md',
+        ['---', 'pm-task: true', 'id: t1', 'title: First', 'status: todo', '---', ''].join('\n')
+      )
+
+      const legacy = expectDefined(await store.loadProjectByPath('Projects/Legacy.md'))
+      await store.updateProject(legacy, { parentPath: parent.filePath })
+      await flush()
+
+      // Legacy project got its own folder and moved under parent
+      expect(app.vault.getAbstractFileByPath('Projects/Parent/Legacy')).toBeInstanceOf(TFolder)
+      expect(app.vault.getAbstractFileByPath('Projects/Legacy.md')).toBeNull()
+      expect(app.vault.getAbstractFileByPath('Projects/Legacy_tasks')).toBeNull()
+      expect(legacy.filePath).toBe('Projects/Parent/Legacy/Legacy.md')
+      expect(app.vault.getAbstractFileByPath('Projects/Parent/Legacy/_tasks/first.md')).toBeInstanceOf(TFile)
+    })
+  })
+
   it('writes a subtask added in the same save as a link, not as an id', async () => {
     const { store, app } = newStore()
     const project = await store.createProject('Links', 'Projects')
