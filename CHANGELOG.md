@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Tasks in the table view can now be reordered by drag-and-drop when sorted by status
 - Added "Open as note" to the project overview and the tab's "More options" menu
 - Added parent project links and a project switcher to the top of the task views
 - Added "Expand all" and "Collapse all" to the table

@@ -162,6 +162,18 @@ button.pm-chip-btn--active:hover {
 .pm-table-row:not(.pm-table-row--selected):hover {
   background: color-mix(in srgb, var(--interactive-accent) 5%, transparent);
 }
+.pm-table-row[draggable='true'] {
+  cursor: grab;
+}
+.pm-table-row--dragging {
+  opacity: 0.4;
+}
+.pm-table-row--drop-before > td {
+  box-shadow: inset 0 2px 0 var(--interactive-accent);
+}
+.pm-table-row--drop-after > td {
+  box-shadow: inset 0 -2px 0 var(--interactive-accent);
+}
 .pm-table-row--done {
   opacity: 0.55;
 }

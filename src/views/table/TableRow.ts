@@ -28,6 +28,7 @@ import {
 } from '@dotpm/ui'
 import { updateSelectCheckboxes, getVisibleTaskIds } from './TableRenderer'
 import type { TableContext, TableState, TableTreeRow } from './TableRenderer'
+import { dropPositionFor } from './dropPosition'
 import { openTaskModal } from '#ui/ModalFactory'
 import { buildTaskContextMenu } from '#ui/TaskContextMenu'
 import { toggleCollapsed } from '../collapse'
@@ -52,6 +53,46 @@ export function renderTaskRow(tbody: HTMLElement, flat: TableTreeRow, ctx: Table
       updateSelectedRow(ctx.state)
     }
   })
+
+  // Drag-and-drop reordering: only enabled when sorting by status only (default sort)
+  const canReorder = ctx.state.sort.every((rule) => rule.key === 'status')
+  if (canReorder) {
+    let dropPosition: 'before' | 'after' = 'before'
+    row.draggable = true
+    row.addEventListener('dragstart', (e: DragEvent) => {
+      e.dataTransfer?.setData('text/plain', task.id)
+      row.addClass('pm-table-row--dragging')
+    })
+    row.addEventListener('dragend', () => {
+      row.removeClass('pm-table-row--dragging')
+      row.removeClass('pm-table-row--drop-before', 'pm-table-row--drop-after')
+    })
+    row.addEventListener('dragover', (e: DragEvent) => {
+      e.preventDefault()
+      const rect = row.getBoundingClientRect()
+      dropPosition = dropPositionFor(e.clientY, rect.top, rect.height)
+      row.removeClass('pm-table-row--drop-before', 'pm-table-row--drop-after')
+      row.addClass(dropPosition === 'before' ? 'pm-table-row--drop-before' : 'pm-table-row--drop-after')
+    })
+    row.addEventListener('dragleave', () => {
+      row.removeClass('pm-table-row--drop-before', 'pm-table-row--drop-after')
+    })
+    row.addEventListener(
+      'drop',
+      safeAsync(async (e: DragEvent) => {
+        e.preventDefault()
+        row.removeClass('pm-table-row--drop-before', 'pm-table-row--drop-after')
+        const draggedId = e.dataTransfer?.getData('text/plain')
+        if (!draggedId || draggedId === task.id) return
+        const dragged = ctx.scope.taskById(draggedId)
+        if (!dragged) return
+        // Only allow reordering within the same project
+        if (ctx.scope.projectOf(draggedId) !== project) return
+        await ctx.plugin.store.reorderTask(project, draggedId, task.id, dropPosition)
+        await ctx.onRefresh()
+      })
+    )
+  }
 
   new SelectCell(row, {
     checked: ctx.state.selectedTaskIds.has(task.id),
